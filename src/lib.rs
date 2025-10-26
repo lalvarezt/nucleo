@@ -34,11 +34,13 @@ use std::time::Duration;
 use parking_lot::Mutex;
 use rayon::ThreadPool;
 
+use crate::frecency::FrecencyStore;
 use crate::pattern::MultiPattern;
-use crate::worker::Worker;
+use crate::worker::{FrecencyContext, Worker};
 pub use nucleo_matcher::{chars, Config, Matcher, Utf32Str, Utf32String};
 
 mod boxcar;
+pub mod frecency;
 mod par_sort;
 pub mod pattern;
 mod worker;
@@ -122,9 +124,10 @@ impl<T> Injector<T> {
 }
 
 /// An [item](crate::Item) that was successfully matched by a [`Nucleo`] worker.
-#[derive(PartialEq, Eq, Debug, Clone, Copy)]
+#[derive(PartialEq, Debug, Clone, Copy)]
 pub struct Match {
     pub score: u32,
+    pub frecency_score: f64,
     pub idx: u32,
 }
 
@@ -284,6 +287,7 @@ pub struct Nucleo<T: Sync + Send + 'static> {
     state: State,
     items: Arc<boxcar::Vec<T>>,
     notify: Arc<(dyn Fn() + Sync + Send)>,
+    frecency_store: Option<Arc<FrecencyStore>>,
     snapshot: Snapshot<T>,
     /// The pattern matched by this matcher. To update the match pattern
     /// [`MultiPattern::reparse`](`pattern::MultiPattern::reparse`) should be used.
@@ -317,6 +321,7 @@ impl<T: Sync + Send + 'static> Nucleo<T> {
             canceled: worker.canceled.clone(),
             should_notify: worker.should_notify.clone(),
             items: worker.items.clone(),
+            frecency_store: None,
             pool,
             pattern: MultiPattern::new(columns as usize),
             snapshot: Snapshot {
@@ -386,6 +391,35 @@ impl<T: Sync + Send + 'static> Nucleo<T> {
     // Defaults to false.
     pub fn reverse_items(&mut self, reverse_items: bool) {
         self.worker.lock().reverse_items(reverse_items)
+    }
+
+    /// Configures frecency-based ranking for this matcher.
+    ///
+    /// The provided `store` is shared with the background workers, while
+    /// `key_extractor` should return an identifier (e.g. file path) for each
+    /// item. Returning `None` skips frecency for that item.
+    pub fn attach_frecency(
+        &mut self,
+        store: Arc<FrecencyStore>,
+        key_extractor: Arc<dyn Fn(&T) -> Option<String> + Send + Sync>,
+    ) {
+        let context = FrecencyContext {
+            store: store.clone(),
+            key_extractor,
+        };
+        self.worker.lock().set_frecency(Some(context));
+        self.frecency_store = Some(store);
+    }
+
+    /// Removes the frecency integration and reverts to fuzzy-only scoring.
+    pub fn detach_frecency(&mut self) {
+        self.worker.lock().set_frecency(None);
+        self.frecency_store = None;
+    }
+
+    /// Returns the currently attached frecency store, if any.
+    pub fn frecency_store(&self) -> Option<Arc<FrecencyStore>> {
+        self.frecency_store.as_ref().map(Arc::clone)
     }
 
     /// The main way to interact with the matcher, this should be called

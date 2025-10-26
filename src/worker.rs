@@ -1,12 +1,15 @@
 use std::cell::UnsafeCell;
+use std::cmp::Ordering;
 use std::mem::take;
 use std::sync::atomic::{self, AtomicBool, AtomicU32};
 use std::sync::Arc;
+use std::time::SystemTime;
 
 use nucleo_matcher::Config;
 use parking_lot::Mutex;
 use rayon::{prelude::*, ThreadPool};
 
+use crate::frecency::FrecencyStore;
 use crate::par_sort::par_quicksort;
 use crate::pattern::{self, MultiPattern};
 use crate::{boxcar, Match};
@@ -24,6 +27,28 @@ impl Matchers {
 unsafe impl Sync for Matchers {}
 unsafe impl Send for Matchers {}
 
+pub(crate) struct FrecencyContext<T: Sync + Send + 'static> {
+    pub(crate) store: Arc<FrecencyStore>,
+    pub(crate) key_extractor: Arc<dyn Fn(&T) -> Option<String> + Send + Sync>,
+}
+
+impl<T: Sync + Send + 'static> Clone for FrecencyContext<T> {
+    fn clone(&self) -> Self {
+        Self {
+            store: Arc::clone(&self.store),
+            key_extractor: Arc::clone(&self.key_extractor),
+        }
+    }
+}
+
+impl<T: Sync + Send + 'static> FrecencyContext<T> {
+    fn score_for(&self, item: &T, now: SystemTime) -> f64 {
+        (self.key_extractor)(item)
+            .map(|key| self.store.score_for(&key, now))
+            .unwrap_or(0.0)
+    }
+}
+
 pub(crate) struct Worker<T: Sync + Send + 'static> {
     pub(crate) running: bool,
     matchers: Matchers,
@@ -37,6 +62,7 @@ pub(crate) struct Worker<T: Sync + Send + 'static> {
     pub(crate) last_snapshot: u32,
     notify: Arc<(dyn Fn() + Sync + Send)>,
     pub(crate) items: Arc<boxcar::Vec<T>>,
+    frecency: Option<FrecencyContext<T>>,
     in_flight: Vec<u32>,
 }
 
@@ -54,6 +80,10 @@ impl<T: Sync + Send + 'static> Worker<T> {
     }
     pub(crate) fn reverse_items(&mut self, reverse_items: bool) {
         self.reverse_items = reverse_items;
+    }
+
+    pub(crate) fn set_frecency(&mut self, frecency: Option<FrecencyContext<T>>) {
+        self.frecency = frecency;
     }
 
     pub(crate) fn new(
@@ -86,6 +116,7 @@ impl<T: Sync + Send + 'static> Worker<T> {
             was_canceled: false,
             notify,
             items: Arc::new(boxcar::Vec::with_capacity(2 * 1024, cols)),
+            frecency: None,
             in_flight: Vec::with_capacity(64),
         };
         (pool, worker)
@@ -94,13 +125,22 @@ impl<T: Sync + Send + 'static> Worker<T> {
     unsafe fn process_new_items(&mut self, unmatched: &AtomicU32) {
         let matchers = &self.matchers;
         let pattern = &self.pattern;
+        let frecency = self.frecency.as_ref().cloned();
+        let now = SystemTime::now();
         self.matches.reserve(self.in_flight.len());
         self.in_flight.retain(|&idx| {
             let Some(item) = self.items.get(idx) else {
                 return true;
             };
             if let Some(score) = pattern.score(item.matcher_columns, matchers.get()) {
-                self.matches.push(Match { score, idx });
+                let frecency_score = frecency
+                    .as_ref()
+                    .map_or(0.0, |ctx| ctx.score_for(item.data, now));
+                self.matches.push(Match {
+                    score,
+                    frecency_score,
+                    idx,
+                });
             };
             false
         });
@@ -108,26 +148,40 @@ impl<T: Sync + Send + 'static> Worker<T> {
         if new_snapshot.end() != self.last_snapshot {
             let end = new_snapshot.end();
             let in_flight = Mutex::new(&mut self.in_flight);
+            let frecency_parallel = frecency.clone();
             let items = new_snapshot.map(|(idx, item)| {
                 let Some(item) = item else {
                     in_flight.lock().push(idx);
                     unmatched.fetch_add(1, atomic::Ordering::Relaxed);
                     return Match {
                         score: 0,
+                        frecency_score: 0.0,
                         idx: u32::MAX,
                     };
                 };
                 if self.canceled.load(atomic::Ordering::Relaxed) {
-                    return Match { score: 0, idx };
+                    return Match {
+                        score: 0,
+                        frecency_score: 0.0,
+                        idx,
+                    };
                 }
                 let Some(score) = pattern.score(item.matcher_columns, matchers.get()) else {
                     unmatched.fetch_add(1, atomic::Ordering::Relaxed);
                     return Match {
                         score: 0,
+                        frecency_score: 0.0,
                         idx: u32::MAX,
                     };
                 };
-                Match { score, idx }
+                let frecency_score = frecency_parallel
+                    .as_ref()
+                    .map_or(0.0, |ctx| ctx.score_for(item.data, now));
+                Match {
+                    score,
+                    frecency_score,
+                    idx,
+                }
             });
             self.matches.par_extend(items);
             self.last_snapshot = end;
@@ -147,15 +201,24 @@ impl<T: Sync + Send + 'static> Worker<T> {
     }
 
     unsafe fn process_new_items_trivial(&mut self) {
+        let frecency = self.frecency.as_ref().cloned();
+        let now = SystemTime::now();
         let new_snapshot = self.items.snapshot(self.last_snapshot);
         if new_snapshot.end() != self.last_snapshot {
             let end = new_snapshot.end();
             let items = new_snapshot.filter_map(|(idx, item)| {
-                if item.is_none() {
+                let Some(item) = item else {
                     self.in_flight.push(idx);
                     return None;
                 };
-                Some(Match { score: 0, idx })
+                let frecency_score = frecency
+                    .as_ref()
+                    .map_or(0.0, |ctx| ctx.score_for(item.data, now));
+                Some(Match {
+                    score: 0,
+                    frecency_score,
+                    idx,
+                })
             });
             self.matches.extend(items);
             self.last_snapshot = end;
@@ -191,6 +254,8 @@ impl<T: Sync + Send + 'static> Worker<T> {
             self.process_new_items_trivial();
             let matchers = &self.matchers;
             let pattern = &self.pattern;
+            let frecency = self.frecency.as_ref().cloned();
+            let now = SystemTime::now();
             self.matches
                 .par_iter_mut()
                 .take_any_while(|_| !self.canceled.load(atomic::Ordering::Relaxed))
@@ -204,9 +269,13 @@ impl<T: Sync + Send + 'static> Worker<T> {
                     let item = self.items.get_unchecked(match_.idx);
                     if let Some(score) = pattern.score(item.matcher_columns, matchers.get()) {
                         match_.score = score;
+                        match_.frecency_score = frecency
+                            .as_ref()
+                            .map_or(0.0, |ctx| ctx.score_for(item.data, now));
                     } else {
                         unmatched.fetch_add(1, atomic::Ordering::Relaxed);
                         match_.score = 0;
+                        match_.frecency_score = 0.0;
                         match_.idx = u32::MAX;
                     }
                 });
@@ -231,6 +300,13 @@ impl<T: Sync + Send + 'static> Worker<T> {
             par_quicksort(
                 &mut self.matches,
                 |match1, match2| {
+                    if let Some(ordering) =
+                        match1.frecency_score.partial_cmp(&match2.frecency_score)
+                    {
+                        if ordering != Ordering::Equal {
+                            return ordering == Ordering::Greater;
+                        }
+                    }
                     if match1.score != match2.score {
                         return match1.score > match2.score;
                     }
@@ -291,7 +367,11 @@ impl<T: Sync + Send + 'static> Worker<T> {
     fn reset_matches(&mut self) {
         self.matches.clear();
         self.matches
-            .extend((0..self.last_snapshot).map(|idx| Match { score: 0, idx }));
+            .extend((0..self.last_snapshot).map(|idx| Match {
+                score: 0,
+                frecency_score: 0.0,
+                idx,
+            }));
         // there are usually only very few in flight items (one for each writer)
         self.remove_in_flight_matches();
     }
