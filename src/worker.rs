@@ -176,10 +176,7 @@ impl<T: Sync + Send + 'static> Worker<T> {
         if self.pattern.is_empty() {
             self.reset_matches();
             self.process_new_items_trivial();
-            let canceled = self.sort_matches();
-            if canceled {
-                self.was_canceled = true;
-            } else if self.should_notify.load(atomic::Ordering::Relaxed) {
+            if self.should_notify.load(atomic::Ordering::Relaxed) {
                 (self.notify)();
             }
             return;
