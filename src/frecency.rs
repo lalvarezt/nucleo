@@ -11,6 +11,20 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 
+// Time unit constants
+const SECONDS_PER_HOUR: u64 = 60 * 60;
+const SECONDS_PER_DAY: u64 = 24 * SECONDS_PER_HOUR;
+
+// Default frecency parameters
+const DEFAULT_HALF_LIFE_DAYS: u64 = 1;
+const DEFAULT_MOMENTUM_WINDOW_HOURS: u64 = 6;
+const DEFAULT_MOMENTUM_MAX_BOOST: f64 = 0.5;
+
+// Frecency algorithm constants
+const HALF_LIFE_DECAY_BASE: f64 = 0.5;
+const FREQUENCY_SMOOTHING: f64 = 1.0;
+const MOMENTUM_BASELINE: f64 = 1.0;
+
 /// Tracks usage statistics for a single item.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, Default)]
 pub struct FrecencyEntry {
@@ -76,9 +90,9 @@ pub struct FrecencyConfig {
 impl Default for FrecencyConfig {
     fn default() -> Self {
         Self {
-            half_life: Duration::from_secs(24 * 60 * 60),
-            momentum_window: Duration::from_secs(6 * 60 * 60),
-            momentum_max_boost: 0.5,
+            half_life: Duration::from_secs(DEFAULT_HALF_LIFE_DAYS * SECONDS_PER_DAY),
+            momentum_window: Duration::from_secs(DEFAULT_MOMENTUM_WINDOW_HOURS * SECONDS_PER_HOUR),
+            momentum_max_boost: DEFAULT_MOMENTUM_MAX_BOOST,
         }
     }
 }
@@ -106,6 +120,25 @@ struct FrecencyInner {
 }
 
 impl FrecencyInner {
+    /// Computes the frecency score for an entry.
+    ///
+    /// The frecency algorithm combines three components:
+    /// - **Frequency**: log2(frequency + 1) - rewards repeated use, logarithmic to prevent dominance
+    /// - **Recency (decay)**: 0.5^(age/half_life) - exponential decay based on time since last access
+    /// - **Momentum**: 1.0 + boost*(1 - Δ/window) - rewards items used in rapid succession
+    ///
+    /// Final score = frequency × decay × momentum
+    ///
+    /// The frequency component adds 1 before taking log2 to:
+    /// 1. Avoid log(0) for new items
+    /// 2. Smooth the logarithmic curve for small frequencies
+    ///
+    /// The decay component uses base 0.5 (half-life decay) where the score halves
+    /// every `half_life` duration since last access.
+    ///
+    /// The momentum component starts at baseline 1.0 (no boost). If the time between
+    /// the last two accesses is within the momentum window, a boost is applied that
+    /// decreases linearly as the gap approaches the window size.
     fn score_entry(&self, entry: &FrecencyEntry, now: SystemTime) -> FrecencyComponents {
         if entry.frequency == 0 || entry.last_access <= 0 {
             return FrecencyComponents {
@@ -116,20 +149,27 @@ impl FrecencyInner {
             };
         }
 
-        let freq_component = ((entry.frequency as f64) + 1.0).log2();
+        // Frequency component: log2(freq + 1)
+        // Adding FREQUENCY_SMOOTHING (1.0) avoids log(0) and smooths small values
+        let freq_component = ((entry.frequency as f64) + FREQUENCY_SMOOTHING).log2();
 
+        // Recency decay: 0.5^(elapsed / half_life)
+        // Uses HALF_LIFE_DECAY_BASE (0.5) for exponential decay
         let now_secs = FrecencyEntry::now_to_secs(now) as f64;
         let last_secs = entry.last_access as f64;
         let elapsed = (now_secs - last_secs).max(0.0);
         let half_life = self.config.half_life.as_secs_f64().max(f64::EPSILON);
-        let decay_component = 0.5_f64.powf(elapsed / half_life);
+        let decay_component = HALF_LIFE_DECAY_BASE.powf(elapsed / half_life);
 
-        let mut momentum_component = 1.0;
+        // Momentum component: starts at MOMENTUM_BASELINE (1.0)
+        // Adds boost if time between last two accesses is within momentum window
+        let mut momentum_component = MOMENTUM_BASELINE;
         if entry.prev_access > 0 {
             let prev_secs = entry.prev_access as f64;
             let delta = (last_secs - prev_secs).max(0.0);
             let window = self.config.momentum_window.as_secs_f64().max(f64::EPSILON);
             if delta < window {
+                // Linear decay: boost decreases from max to 0 as delta approaches window
                 let ratio = delta / window;
                 momentum_component += self.config.momentum_max_boost * (1.0 - ratio);
             }
