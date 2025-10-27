@@ -42,9 +42,9 @@ impl<T: Sync + Send + 'static> Clone for FrecencyContext<T> {
 }
 
 impl<T: Sync + Send + 'static> FrecencyContext<T> {
-    fn score_for(&self, item: &T, now: SystemTime) -> f64 {
+    fn score_for(&self, item: &T, now_secs: u32) -> f32 {
         (self.key_extractor)(item)
-            .map(|key| self.store.score_for(&key, now))
+            .map(|key| self.store.score_for_timestamp(&key, now_secs))
             .unwrap_or(0.0)
     }
 }
@@ -126,7 +126,10 @@ impl<T: Sync + Send + 'static> Worker<T> {
         let matchers = &self.matchers;
         let pattern = &self.pattern;
         let frecency = self.frecency.as_ref().cloned();
-        let now = SystemTime::now();
+        let now_secs = SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs() as u32;
         self.matches.reserve(self.in_flight.len());
         self.in_flight.retain(|&idx| {
             let Some(item) = self.items.get(idx) else {
@@ -135,7 +138,7 @@ impl<T: Sync + Send + 'static> Worker<T> {
             if let Some(score) = pattern.score(item.matcher_columns, matchers.get()) {
                 let frecency_score = frecency
                     .as_ref()
-                    .map_or(0.0, |ctx| ctx.score_for(item.data, now));
+                    .map_or(0.0, |ctx| ctx.score_for(item.data, now_secs));
                 self.matches.push(Match {
                     score,
                     frecency_score,
@@ -176,7 +179,7 @@ impl<T: Sync + Send + 'static> Worker<T> {
                 };
                 let frecency_score = frecency_parallel
                     .as_ref()
-                    .map_or(0.0, |ctx| ctx.score_for(item.data, now));
+                    .map_or(0.0, |ctx| ctx.score_for(item.data, now_secs));
                 Match {
                     score,
                     frecency_score,
@@ -202,7 +205,10 @@ impl<T: Sync + Send + 'static> Worker<T> {
 
     unsafe fn process_new_items_trivial(&mut self) {
         let frecency = self.frecency.as_ref().cloned();
-        let now = SystemTime::now();
+        let now_secs = SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs() as u32;
         let new_snapshot = self.items.snapshot(self.last_snapshot);
         if new_snapshot.end() != self.last_snapshot {
             let end = new_snapshot.end();
@@ -213,7 +219,7 @@ impl<T: Sync + Send + 'static> Worker<T> {
                 };
                 let frecency_score = frecency
                     .as_ref()
-                    .map_or(0.0, |ctx| ctx.score_for(item.data, now));
+                    .map_or(0.0, |ctx| ctx.score_for(item.data, now_secs));
                 Some(Match {
                     score: 0,
                     frecency_score,
@@ -255,7 +261,10 @@ impl<T: Sync + Send + 'static> Worker<T> {
             let matchers = &self.matchers;
             let pattern = &self.pattern;
             let frecency = self.frecency.as_ref().cloned();
-            let now = SystemTime::now();
+            let now_secs = SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs() as u32;
             self.matches
                 .par_iter_mut()
                 .take_any_while(|_| !self.canceled.load(atomic::Ordering::Relaxed))
@@ -271,7 +280,7 @@ impl<T: Sync + Send + 'static> Worker<T> {
                         match_.score = score;
                         match_.frecency_score = frecency
                             .as_ref()
-                            .map_or(0.0, |ctx| ctx.score_for(item.data, now));
+                            .map_or(0.0, |ctx| ctx.score_for(item.data, now_secs));
                     } else {
                         unmatched.fetch_add(1, atomic::Ordering::Relaxed);
                         match_.score = 0;

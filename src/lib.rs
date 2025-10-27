@@ -127,7 +127,7 @@ impl<T> Injector<T> {
 #[derive(PartialEq, Debug, Clone, Copy)]
 pub struct Match {
     pub score: u32,
-    pub frecency_score: f64,
+    pub frecency_score: f32,
     pub idx: u32,
 }
 
